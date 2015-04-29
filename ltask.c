@@ -86,14 +86,24 @@ ltask(lua_State *L) {
 	return 1;
 }
 
+struct workshop;
+
 struct worker {
+	struct workshop * workshop;
+	struct thread_event event;
 	int id;
-	struct schedule *s; 
+	int suspend;
+};
+
+struct workshop {
+	int threads;
+	struct worker * w;
 };
 
 static int
 run_slice(struct worker *w) {
-	struct ltask *t = schedule_grabtask(w->s, w->id);
+	struct schedule *s = S;
+	struct ltask *t = schedule_grabtask(s, w->id);
 	if (t == NULL)
 		return 0;
 	lua_State *L = t->L;
@@ -101,7 +111,7 @@ run_slice(struct worker *w) {
 	int ret = lua_resume(L, NULL, args);
 	if (ret == LUA_YIELD) {
 		lua_settop(L, 0);
-		schedule_releasetask(w->s, t->id);
+		schedule_releasetask(s, t->id);
 		return 1;
 	}
 	if (ret != LUA_OK) {
@@ -110,15 +120,29 @@ run_slice(struct worker *w) {
 	}
 	t->L = NULL;
 	lua_close(L);
-	schedule_closetask(w->s, t->id);
-	schedule_releasetask(w->s, t->id);
+	schedule_closetask(s, t->id);
+	schedule_releasetask(s, t->id);
 	return 1;
 }
 
 static void
 worker_func(void *p) {
 	struct worker *w = p;
-	while (run_slice(w));
+	for (;;) {
+		w->suspend = 0;
+		while (run_slice(w)) {
+			struct workshop * ws = w->workshop;
+			int i;
+			for (i=0;i<ws->threads;i++) {
+				struct worker *w = &ws->w[i];
+				if (w->suspend) {
+					thread_event_trigger(&w->event);
+				}
+			}
+		}
+		w->suspend = 1;
+		thread_event_wait(&w->event);
+	}
 }
 
 static int
@@ -127,14 +151,22 @@ lrun(lua_State *L) {
 	int threads = schedule_threads(S);
 	struct worker w[threads];
 	struct thread t[threads];
+	struct workshop ws;
+	ws.threads = threads;
+	ws.w = w;
 	int i;
 	for (i=0;i<threads;i++) {
 		w[i].id = i;
-		w[i].s = S;
+		w[i].suspend = 0;
+		w[i].workshop = &ws;
+		thread_event_create(&w[i].event);
 		t[i].func = worker_func;
 		t[i].ud = &w[i];
 	}
 	thread_join(t,threads);
+	for (i=0;i<threads;i++) {
+		thread_event_release(&w[i].event);
+	}
 	return 0;
 }
 
